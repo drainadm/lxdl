@@ -21,7 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ========= ENV / CONFIG =========
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "8475681655:AAE10f4jbdYZ0Q2fgTLvQ1HhXK8U6KQ9gD0"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "PASTE_YOUR_TOKEN"
 OPEN_DOTA = "https://api.opendota.com/api"
 DB_PATH = os.getenv("DB_PATH", "data.db")
 
@@ -33,7 +33,7 @@ ASSUMED_MMR_DELTA = 30  # эвристика дельты MMR за ranked (ес�
 STREAK_NOTIFY_WIN = 5     # винстрик N+
 STREAK_NOTIFY_LOSE = 5    # лузстрик N+
 
-if not BOT_TOKEN or BOT_TOKEN == "8475681655:AAE10f4jbdYZ0Q2fgTLvQ1HhXK8U6KQ9gD0":
+if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN":
     raise SystemExit("Set BOT_TOKEN env variable with your Telegram bot token.")
 
 logging.basicConfig(level=logging.INFO)
