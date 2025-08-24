@@ -1,60 +1,87 @@
+#!/usr/bin/env python3
+"""
+Dota2 Telegram Tracker Bot - full version (single file)
+Features:
+- Steam binding (steam32, steam64, profiles/<steam64>)
+- Auto MMR (approx. from rank_tier) + manual MMR override via "mmr 4321"
+- Last match (any mode), Last 10 ranked, heroes analytics (top15), activity & MMR trend charts (PNG)
+- Daily report at 23:59 MSK (always sent, even if 0 games)
+- Polling OpenDota for new matches every POLL_INTERVAL seconds (default 60)
+- Notifications: new match, streak alerts, rank up/down
+- Caching OpenDota results for short TTL to reduce latency (default 90s)
+- SQLite for persistence (users + matches)
+- Designed to run on Railway / Heroku-like platforms
+"""
+
 import os
 import re
+import json
 import math
-import asyncio
-import logging
+import time
 import sqlite3
+import logging
+import aiohttp
+import asyncio
+import tempfile
 from contextlib import closing
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
 
-import aiohttp
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
+# aiogram v3 style
+from aiogram import Bot, Dispatcher
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     FSInputFile
 )
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram import F
 
+# matplotlib for charts
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ========= ENV / CONFIG =========
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN") or "PASTE_YOUR_TOKEN"
-OPEN_DOTA = "https://api.opendota.com/api"
-DB_PATH = os.getenv("DB_PATH", "data.db")
-
-POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL", "60"))
-MSK_OFFSET_HOURS = 3  # UTC+3
-ASSUMED_MMR_DELTA = 30  # эвристика дельты MMR за ranked (если нет точных данных)
-
-# нотификации
-STREAK_NOTIFY_WIN = 5     # винстрик N+
-STREAK_NOTIFY_LOSE = 5    # лузстрик N+
-
-if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_TOKEN":
+# ---------------- CONFIG ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
     raise SystemExit("Set BOT_TOKEN env variable with your Telegram bot token.")
 
+OPEN_DOTA = "https://api.opendota.com/api"
+DB_PATH = os.getenv("DB_PATH", "dota_bot.db")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))     # seconds
+CACHE_TTL = int(os.getenv("CACHE_TTL", "90"))             # seconds for OpenDota caching
+MSK_OFFSET = int(os.getenv("MSK_OFFSET", "3"))            # MSK offset from UTC
+ASSUMED_MMR_DELTA = int(os.getenv("ASSUMED_MMR_DELTA", "30"))
+DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "23"))
+DAILY_REPORT_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", "59"))
+
+STREAK_NOTIFY_WIN = int(os.getenv("STREAK_NOTIFY_WIN", "5"))
+STREAK_NOTIFY_LOSE = int(os.getenv("STREAK_NOTIFY_LOSE", "5"))
+
+# Logging
 logging.basicConfig(level=logging.INFO)
-bot = Bot(BOT_TOKEN)
+logger = logging.getLogger("dota_bot")
+
+# ---------------- BOT / DISPATCHER ----------------
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ========= DB =========
-def db_init():
+# ---------------- SQLITE DB ----------------
+def init_db():
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("""
         CREATE TABLE IF NOT EXISTS users (
             telegram_id INTEGER PRIMARY KEY,
             steam32 TEXT,
-            current_mmr INTEGER,       -- авто/MMR-оценка (rank_tier + дельты)
-            user_set_mmr INTEGER,      -- точный MMR, если пользователь указал вручную
+            exact_mmr INTEGER,      -- user-specified exact mmr
+            current_mmr INTEGER,    -- auto/estimated mmr
             max_mmr INTEGER,
-            last_any_match_id INTEGER,
-            last_ranked_match_id INTEGER,
-            last_rank_tier INTEGER,    -- для детекта rank up/down
-            created_at INTEGER DEFAULT (strftime('%s','now'))
+            last_any_match INTEGER,
+            last_ranked_match INTEGER,
+            last_rank_tier INTEGER,
+            created_ts INTEGER DEFAULT (strftime('%s','now'))
         )
         """)
         con.execute("""
@@ -64,14 +91,13 @@ def db_init():
             start_time INTEGER,
             duration INTEGER,
             hero_id INTEGER,
-            k INTEGER, d INTEGER, a INTEGER,
+            kills INTEGER, deaths INTEGER, assists INTEGER,
             lobby_type INTEGER,
             game_mode INTEGER,
             radiant_win INTEGER,
             player_slot INTEGER,
             net_worth INTEGER,
             gpm INTEGER,
-            role TEXT,                 -- 'core'/'support' (эвристика)
             delta_mmr INTEGER,
             mmr_after INTEGER,
             PRIMARY KEY (steam32, match_id)
@@ -79,932 +105,886 @@ def db_init():
         """)
         con.commit()
 
-def db_get_user(tg_id: int) -> Optional[dict]:
+def db_get_user(tg: int) -> Optional[Dict[str, Any]]:
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.row_factory = sqlite3.Row
-        r = con.execute("SELECT * FROM users WHERE telegram_id=?", (tg_id,)).fetchone()
+        r = con.execute("SELECT * FROM users WHERE telegram_id=?", (tg,)).fetchone()
         return dict(r) if r else None
 
-def db_set_user_steam(tg_id: int, steam32: str):
+def db_set_user_steam(tg: int, steam32: int):
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.execute("""
-        INSERT INTO users (telegram_id, steam32)
-        VALUES (?,?)
+        INSERT INTO users (telegram_id, steam32) VALUES (?,?)
         ON CONFLICT(telegram_id) DO UPDATE SET steam32=excluded.steam32
-        """, (tg_id, steam32))
+        """, (tg, str(steam32)))
         con.commit()
 
-def db_update_auto_mmr(tg_id: int, new_mmr: Optional[int]):
+def db_update_exact_mmr(tg: int, mmr: Optional[int]):
     with closing(sqlite3.connect(DB_PATH)) as con:
-        if new_mmr is None:
-            con.execute("UPDATE users SET current_mmr=NULL WHERE telegram_id=?", (tg_id,))
+        con.execute("UPDATE users SET exact_mmr=? WHERE telegram_id=?", (mmr, tg))
+        con.commit()
+
+def db_update_auto_mmr(tg: int, mmr: Optional[int]):
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        if mmr is None:
+            con.execute("UPDATE users SET current_mmr=NULL WHERE telegram_id=?", (tg,))
         else:
             con.execute("""
             UPDATE users
-            SET current_mmr=?, max_mmr=MAX(COALESCE(max_mmr,0), ?)
+            SET current_mmr=?, max_mmr=MAX(COALESCE(max_mmr,0),?)
             WHERE telegram_id=?
-            """, (new_mmr, new_mmr, tg_id))
+            """, (mmr, mmr, tg))
         con.commit()
 
-def db_set_user_mmr(tg_id: int, mmr: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute("""
-        UPDATE users
-        SET user_set_mmr=?, max_mmr=MAX(COALESCE(max_mmr,0), ?)
-        WHERE telegram_id=?
-        """, (mmr, mmr, tg_id))
-        con.commit()
-
-def db_clear_user_mmr(tg_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute("UPDATE users SET user_set_mmr=NULL WHERE telegram_id=?", (tg_id,))
-        con.commit()
-
-def db_set_last_match_ids(tg_id: int, any_id: Optional[int]=None, ranked_id: Optional[int]=None):
+def db_set_last_ids(tg:int, any_id: Optional[int]=None, ranked_id: Optional[int]=None):
     with closing(sqlite3.connect(DB_PATH)) as con:
         if any_id is not None:
-            con.execute("UPDATE users SET last_any_match_id=? WHERE telegram_id=?", (any_id, tg_id))
+            con.execute("UPDATE users SET last_any_match=? WHERE telegram_id=?", (any_id, tg))
         if ranked_id is not None:
-            con.execute("UPDATE users SET last_ranked_match_id=? WHERE telegram_id=?", (ranked_id, tg_id))
+            con.execute("UPDATE users SET last_ranked_match=? WHERE telegram_id=?", (ranked_id, tg))
         con.commit()
 
-def db_set_last_rank_tier(tg_id: int, tier: Optional[int]):
+def db_set_last_rank_tier(tg:int, tier: Optional[int]):
     with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute("UPDATE users SET last_rank_tier=? WHERE telegram_id=?", (tier, tg_id))
+        con.execute("UPDATE users SET last_rank_tier=? WHERE telegram_id=?", (tier, tg))
         con.commit()
 
-def effective_mmr(u: dict) -> Optional[int]:
-    # приоритет ручного MMR, затем авто
-    return u.get("user_set_mmr") if u.get("user_set_mmr") is not None else u.get("current_mmr")
-
-def db_upsert_match(steam32: str, m: dict, net_worth: Optional[int],
-                    gpm: Optional[int], role: str,
-                    delta_mmr: Optional[int], mmr_after: Optional[int]):
+def db_upsert_match(steam32:str, m:dict, nw:Optional[int], gpm:Optional[int], delta:Optional[int], mmr_after:Optional[int]):
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.execute("""
-        INSERT INTO matches (steam32, match_id, start_time, duration, hero_id, k, d, a,
-                             lobby_type, game_mode, radiant_win, player_slot, net_worth,
-                             gpm, role, delta_mmr, mmr_after)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO matches (steam32, match_id, start_time, duration, hero_id, kills, deaths, assists,
+                             lobby_type, game_mode, radiant_win, player_slot, net_worth, gpm, delta_mmr, mmr_after)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(steam32, match_id) DO UPDATE SET
             start_time=excluded.start_time,
             duration=excluded.duration,
             hero_id=excluded.hero_id,
-            k=excluded.k, d=excluded.d, a=excluded.a,
-            lobby_type=excluded.lobby_type,
-            game_mode=excluded.game_mode,
-            radiant_win=excluded.radiant_win,
-            player_slot=excluded.player_slot,
-            net_worth=excluded.net_worth,
-            gpm=excluded.gpm,
-            role=excluded.role,
-            delta_mmr=excluded.delta_mmr,
-            mmr_after=excluded.mmr_after
+            kills=excluded.kills, deaths=excluded.deaths, assists=excluded.assists,
+            lobby_type=excluded.lobby_type, game_mode=excluded.game_mode,
+            radiant_win=excluded.radiant_win, player_slot=excluded.player_slot,
+            net_worth=excluded.net_worth, gpm=excluded.gpm,
+            delta_mmr=excluded.delta_mmr, mmr_after=excluded.mmr_after
         """, (
             steam32,
             m.get("match_id"), m.get("start_time"), m.get("duration"), m.get("hero_id"),
             m.get("kills",0), m.get("deaths",0), m.get("assists",0),
             m.get("lobby_type"), m.get("game_mode"), int(bool(m.get("radiant_win"))),
-            m.get("player_slot"), net_worth, gpm, role, delta_mmr, mmr_after
+            m.get("player_slot"), nw, gpm, delta, mmr_after
         ))
         con.commit()
 
-def db_last_matches(steam32: str, limit: int=10) -> List[dict]:
+def db_last_matches(steam32:str, limit:int=10) -> List[Dict[str,Any]]:
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.row_factory = sqlite3.Row
-        rs = con.execute("""
-        SELECT * FROM matches WHERE steam32=?
-        ORDER BY start_time DESC LIMIT ?
-        """, (steam32, limit)).fetchall()
+        rs = con.execute("SELECT * FROM matches WHERE steam32=? ORDER BY start_time DESC LIMIT ?", (steam32, limit)).fetchall()
         return [dict(r) for r in rs]
 
-def db_role_wr(steam32: str) -> Dict[str, Dict[str,int]]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.row_factory = sqlite3.Row
-        rs = con.execute("""
-        SELECT role, radiant_win, player_slot FROM matches
-        WHERE steam32=? AND role IS NOT NULL
-        """, (steam32,)).fetchall()
-    stat = {"core":{"g":0,"w":0}, "support":{"g":0,"w":0}}
-    for r in rs:
-        role = r["role"]
-        if role not in stat: continue
-        win = ((r["player_slot"]<128) and (r["radiant_win"]==1)) or \
-              ((r["player_slot"]>=128) and (r["radiant_win"]==0))
-        stat[role]["g"] += 1
-        if win: stat[role]["w"] += 1
-    return stat
-
-def db_hero_agg(steam32: str) -> List[dict]:
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.row_factory = sqlite3.Row
-        rs = con.execute("""
-        SELECT hero_id,
-               COUNT(*) games,
-               SUM(CASE WHEN ((player_slot<128 AND radiant_win=1) OR (player_slot>=128 AND radiant_win=0)) THEN 1 ELSE 0 END) wins,
-               AVG(COALESCE(net_worth,0)) avg_nw
-        FROM matches
-        WHERE steam32=?
-        GROUP BY hero_id
-        """, (steam32,)).fetchall()
-        return [dict(r) for r in rs]
-
-def db_calc_streak_dir(steam32: str) -> int:
-    """>0 — винстрик длиной N, <0 — лузстрик длиной N"""
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.row_factory = sqlite3.Row
-        rs = con.execute("""
-        SELECT radiant_win, player_slot FROM matches
-        WHERE steam32=? ORDER BY start_time DESC LIMIT 50
-        """, (steam32,)).fetchall()
-    cnt = 0
-    last_win = None
-    for r in rs:
-        win = ((r["player_slot"] < 128) and (r["radiant_win"] == 1)) or \
-              ((r["player_slot"] >= 128) and (r["radiant_win"] == 0))
-        if last_win is None:
-            last_win = win
-            cnt = 1
-        elif win == last_win:
-            cnt += 1
-        else:
-            break
-    return cnt if (last_win is True) else (-cnt if cnt else 0)
-
-# ========= HELPERS =========
-STEAM_PROFILE_RE = re.compile(r"(?:https?://)?steamcommunity\.com/(?:id|profiles)/([^/\s]+)", re.I)
-STEAM64_OFFSET = 76561197960265728
-
-def steam_any_to_steam32(value: str) -> Optional[str]:
-    s = (value or "").strip()
-    m = STEAM_PROFILE_RE.search(s)
-    if m:
-        part = m.group(1)
-        if part.isdigit() and len(part) >= 16:
-            return str(int(part) - STEAM64_OFFSET)
-        return None  # vanity /id/<name> без Steam Web API не резолвим
-    if not s.isdigit(): return None
-    if len(s) >= 16:
-        return str(int(s) - STEAM64_OFFSET)
-    return s
-
-def fmt_duration(sec: int) -> str:
-    sec = int(max(0, sec or 0))
-    mm, ss = divmod(sec, 60)
-    hh, mm = divmod(mm, 60)
-    return f"{hh}:{mm:02d}:{ss:02d}" if hh else f"{mm}:{ss:02d}"
-
-def ts_msk_str(ts: int) -> str:
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc) + timedelta(hours=MSK_OFFSET_HOURS)
-    return dt.strftime("%d.%m.%Y %H:%M МСК")
-
-def is_win(player_slot: int, radiant_win: bool) -> bool:
-    rad = player_slot < 128
-    return (rad and radiant_win) or ((not rad) and (not radiant_win))
-
-def kda_str(k: int, d: int, a: int) -> str:
-    ratio = (k + a) / max(1, d)
-    return f"{k}/{d}/{a} (KDA {ratio:.2f})"
-
-def rank_name(rank_tier: Optional[int]) -> str:
-    if not isinstance(rank_tier, int): return "—"
-    names = {1:"Herald",2:"Guardian",3:"Crusader",4:"Archon",5:"Legend",6:"Ancient",7:"Divine",8:"Immortal"}
-    return f"{names.get(rank_tier//10,'?')} {rank_tier%10}"
-
-def mmr_from_rank_tier(rank_tier: Optional[int]) -> Optional[int]:
-    if not isinstance(rank_tier, int): return None
-    base = {1:0,2:560,3:1260,4:1960,5:2660,6:3360,7:4060,8:5200}
-    major = rank_tier // 10
-    minor = rank_tier % 10
-    if major not in base: return None
-    return base[major] + (minor-1)*140 if minor>=1 else base[major]
-
-def next_star_need(rank_tier: Optional[int]) -> Optional[int]:
-    cur = mmr_from_rank_tier(rank_tier)
-    return 140 if cur is not None else None
-
-def lobby_name(lobby_type: Optional[int]) -> str:
-    table = {0:"Unranked",1:"Practice",2:"Tournament",3:"Tutorial",4:"Co-op Bots",
-             5:"Ranked Team",6:"Ranked Solo",7:"Ranked",8:"1v1 Mid",9:"Battle Cup"}
-    return table.get(lobby_type, "Custom/Unknown")
-
-def game_mode_name(game_mode: Optional[int]) -> str:
-    table = {1:"All Pick",2:"Captains Mode",3:"Random Draft",4:"Single Draft",5:"All Random",
-             12:"Least Played",13:"Limited Heroes",14:"Compendium",15:"Custom",16:"Captains Draft",
-             17:"Balanced Draft",18:"Ability Draft",19:"Event",20:"ARDM",21:"1v1 Mid",22:"All Draft",
-             23:"Turbo",24:"Mutation",25:"Coaches Challenge"}
-    return table.get(game_mode, "Unknown")
-
-def guess_role(purchases: List[str], gpm: int) -> str:
-    core_items = {"bkb","manta","daedalus","skadi","desolator","battle_fury","butterfly","radiance","satanic"}
-    sup_items  = {"mekansm","glimmer_cape","force_staff","guardian_greaves","solar_crest","lotus_orb","pipe","urn_of_shadows","spirit_vessel"}
-    s = set(purchases or [])
-    if any(x in s for x in core_items) or gpm >= 450:
-        return "core"
-    if any(x in s for x in sup_items) or gpm <= 350:
-        return "support"
-    return "core"  # дефолт
-
-# ========= OPEN DOTA =========
-async def od_get(session: aiohttp.ClientSession, path: str, params: dict=None) -> Any:
-    async with session.get(f"{OPEN_DOTA}{path}", params=params, timeout=25) as r:
-        if r.status == 404:
-            return None
-        r.raise_for_status()
-        return await r.json()
-
-async def fetch_player(session, steam32: str) -> Optional[dict]:
-    return await od_get(session, f"/players/{steam32}")
-
-async def fetch_player_wl(session, steam32: str) -> Optional[dict]:
-    return await od_get(session, f"/players/{steam32}/wl")
-
-async def fetch_player_heroes(session, steam32: str) -> Optional[List[dict]]:
-    return await od_get(session, f"/players/{steam32}/heroes")
-
-async def fetch_heroes_map(session) -> Dict[int, str]:
-    arr = await od_get(session, "/heroes") or []
-    return {h["id"]: h["localized_name"] for h in arr}
-
-async def fetch_last_matches(session, steam32: str, limit: int=10, ranked_only: bool=False) -> List[dict]:
-    params = {"limit": limit}
-    if ranked_only:
-        params["lobby_type"] = 7
-    return await od_get(session, f"/players/{steam32}/matches", params=params) or []
-
-async def fetch_match_detail(session, match_id: int) -> Optional[dict]:
-    return await od_get(session, f"/matches/{match_id}")
-
-# ========= KEYBOARDS =========
-def main_menu(bound: bool) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="🏆 Статус", callback_data="status"),
-         InlineKeyboardButton(text="🎮 Последние 10 матчей", callback_data="last10")],
-        [InlineKeyboardButton(text="🧙 Герои", callback_data="heroes_menu"),
-         InlineKeyboardButton(text="📈 Графики", callback_data="charts_menu")],
-        [InlineKeyboardButton(text=("🔁 Сменить аккаунт" if bound else "🔗 Привязать аккаунт"),
-                              callback_data="bind")],
-        [InlineKeyboardButton(text="🤖 Совет по сборке (последний матч)", callback_data="ai_last")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def heroes_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔝 По играм", callback_data="heroes_sort_games"),
-         InlineKeyboardButton(text="✅ По винрейту (≥10 игр)", callback_data="heroes_sort_wr")],
-        [InlineKeyboardButton(text="⚔ По KDA (≥10 игр)", callback_data="heroes_sort_kda")],
-        [InlineKeyboardButton(text="🧠 Топ героев по WR/NetWorth", callback_data="heroes_analytics")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="back_main")]
-    ])
-
-def charts_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Активность (7 дней)", callback_data="activity")],
-        [InlineKeyboardButton(text="📉 Тренд MMR", callback_data="mmr_trend")],
-        [InlineKeyboardButton(text="🎭 Винрейт по ролям", callback_data="role_wr")],
-        [InlineKeyboardButton(text="⚙ Указать точный MMR", callback_data="set_mmr")],
-        [InlineKeyboardButton(text="⬅ Назад", callback_data="back_main")]
-    ])
-
-# ========= BOT =========
-@dp.message(Command("start"))
-async def on_start(m: Message):
-    db_init()
-    u = db_get_user(m.from_user.id)
-    await m.answer(
-        "👋 Привет! Я трекер Dota 2: статус, матчи, герои, графики, подсказки и уведомления.\n"
-        "Начни с привязки аккаунта.",
-        reply_markup=main_menu(bool(u and u.get("steam32")))
-    )
-
-@dp.callback_query(F.data == "back_main")
-async def back_main(cb: CallbackQuery):
-    u = db_get_user(cb.from_user.id)
-    await cb.message.edit_text("Главное меню:", reply_markup=main_menu(bool(u and u.get("steam32"))))
-    await cb.answer()
-
-# ----- Привязка -----
-@dp.callback_query(F.data == "bind")
-async def on_bind(cb: CallbackQuery):
-    await cb.message.answer(
-        "🔗 Пришли свой Steam:\n"
-        "• Steam32 / Steam64\n"
-        "• или ссылку на профиль вида https://steamcommunity.com/profiles/XXXXXXXXXXXXXXX\n"
-        "(vanity /id/<name> не поддерживается)"
-    )
-    await cb.answer()
-
-@dp.message()
-async def bind_or_setmmr(m: Message):
-    text = (m.text or "").strip()
-    if not text:
-        return
-
-    # обработка ввода MMR (режим ожидания помечаем простым флагом user state в SQLite? проще через метку файла)
-    # Упростим: командный формат "mmr 4321"
-    if text.lower().startswith("mmr "):
-        try:
-            val = int(text.split()[1])
-            if val <= 0 or val > 15000:
-                raise ValueError
-            db_set_user_mmr(m.from_user.id, val)
-            await m.answer(f"✅ Точный MMR сохранён: {val}")
-            return
-        except Exception:
-            await m.answer("❌ Формат: <code>mmr 4321</code>", parse_mode="HTML")
-            return
-
-    # привязка аккаунта
-    if (text.isdigit() or "steamcommunity.com" in text):
-        steam32 = steam_any_to_steam32(text)
-        if not steam32:
-            await m.answer("❌ Не удалось определить Steam ID. Пришли Steam64 или ссылку с /profiles/.")
-            return
-
-        async with aiohttp.ClientSession() as sess:
-            player = await fetch_player(sess, steam32)
-        if not player or not player.get("profile"):
-            await m.answer("❌ Профиль не найден в OpenDota. Авторизуйся на opendota.com через Steam и открой игровой профиль в Dota 2.")
-            return
-
-        db_set_user_steam(m.from_user.id, steam32)
-        # первичное авто-MMR по рангу
-        rank_tier = player.get("rank_tier")
-        est = mmr_from_rank_tier(rank_tier)
-        db_update_auto_mmr(m.from_user.id, est)
-        db_set_last_rank_tier(m.from_user.id, rank_tier)
-
-        await m.answer("✅ Аккаунт привязан! Советы: можешь прислать «<code>mmr 4321</code>» для точности.", parse_mode="HTML",
-                       reply_markup=main_menu(True))
-
-# ----- Меню графиков -----
-@dp.callback_query(F.data == "charts_menu")
-async def charts_menu(cb: CallbackQuery):
-    await cb.message.answer("Выбери действие:", reply_markup=charts_keyboard()); await cb.answer()
-
-# ----- Указать точный MMR -----
-@dp.callback_query(F.data == "set_mmr")
-async def on_set_mmr(cb: CallbackQuery):
-    await cb.message.answer("✍ Пришли сообщением в чат: <code>mmr 4321</code>", parse_mode="HTML")
-    await cb.answer()
-
-# ----- Статус -----
-@dp.callback_query(F.data == "status")
-async def on_status(cb: CallbackQuery):
-    u = db_get_user(cb.from_user.id)
-    if not u or not u.get("steam32"):
-        await cb.message.answer("Сначала привяжи аккаунт.", reply_markup=main_menu(False)); await cb.answer(); return
-    steam32 = u["steam32"]
-
-    async with aiohttp.ClientSession() as sess:
-        player = await fetch_player(sess, steam32)
-        wl = await fetch_player_wl(sess, steam32)
-
-    prof = (player or {}).get("profile") or {}
-    rank_tier = player.get("rank_tier")
-    rank = rank_name(rank_tier)
-    auto_mmr = mmr_from_rank_tier(rank_tier)
-    if auto_mmr is not None:
-        db_update_auto_mmr(cb.from_user.id, auto_mmr)  # обновим авто-оценку
-    need_star = next_star_need(rank_tier)
-    plus = bool(prof.get("plus"))
-    streak_dir = db_calc_streak_dir(steam32)
-    streak_text = f"{abs(streak_dir)} {'побед' if streak_dir>0 else 'поражений'} подряд" if streak_dir else "—"
-    max_mmr = u.get("max_mmr") or auto_mmr
-    last_any = u.get("last_any_match_id")
-    eff_mmr = effective_mmr(db_get_user(cb.from_user.id))
-
-    lines = [
-        "🏆 <b>Статус аккаунта</b>",
-        f"👤 Ник: <b>{prof.get('personaname','—')}</b>",
-        f"🆔 Steam32: <b>{steam32}</b>",
-        f"🏅 Ранг: <b>{rank}</b>",
-        f"📈 MMR: <b>{eff_mmr if eff_mmr is not None else '—'}</b>" + (f" | до след.★: <b>{need_star} MMR</b>" if need_star else ""),
-        f"💛 Dota Plus: <b>{'Да' if plus else 'Нет'}</b>",
-        f"🔥 Серия: <b>{streak_text}</b>",
-        f"🔝 Макс. MMR: <b>{max_mmr if max_mmr is not None else '—'}</b>",
-        f"🔗 OpenDota: <a href='https://www.opendota.com/players/{steam32}'>профиль</a>"
-    ]
-    if last_any:
-        lines.append(f"🕓 Последний матч: <a href='https://www.opendota.com/matches/{last_any}'>#{last_any}</a>")
-
-    await cb.message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
-    await cb.answer()
-
-# ----- Последние 10 матчей -----
-@dp.callback_query(F.data == "last10")
-async def on_last10(cb: CallbackQuery):
-    u = db_get_user(cb.from_user.id)
-    if not u or not u.get("steam32"):
-        await cb.message.answer("Сначала привяжи аккаунт.", reply_markup=main_menu(False)); await cb.answer(); return
-    steam32 = u["steam32"]
-
-    rows = db_last_matches(steam32, 10)
-    if not rows:
-        # если пусто — подтянем 10 матчей сейчас
-        async with aiohttp.ClientSession() as sess:
-            arr = await fetch_last_matches(sess, steam32, 10, ranked_only=False)
-            heroes_map = await fetch_heroes_map(sess)
-            for m in arr:
-                detail = await fetch_match_detail(sess, m["match_id"])
-                nw = gpm = None
-                role = "core"
-                if detail and "players" in detail:
-                    you = next((p for p in detail["players"] if p.get("account_id")==int(steam32)), None)
-                    if you:
-                        nw = you.get("net_worth")
-                        gpm = you.get("gold_per_min")
-                        purchases = [log.get("key","") for log in you.get("purchase_log", [])]
-                        role = guess_role(purchases, gpm or 0)
-                db_upsert_match(steam32, m, nw, gpm, role, None, None)
-        rows = db_last_matches(steam32, 10)
-
-    lines = ["🎮 <b>Последние 10 матчей</b> (все режимы)"]
-    for i, r in enumerate(rows, 1):
-        mode = f"{lobby_name(r['lobby_type'])} | {game_mode_name(r['game_mode'])}"
-        win = is_win(r["player_slot"], bool(r["radiant_win"]))
-        flag = "✅" if win else "❌"
-        kdastr = kda_str(r["k"], r["d"], r["a"])
-        mmr_part = ""
-        if r["lobby_type"] == 7 and r["delta_mmr"] is not None and r["mmr_after"] is not None:
-            arrow = "▲" if r["delta_mmr"] > 0 else "▼" if r["delta_mmr"] < 0 else "•"
-            mmr_part = f" | {arrow} {r['delta_mmr']:+d} (MMR: {r['mmr_after']})"
-        lines.append(
-            f"{i}) {flag} {mode} | {kdastr} | <a href='https://www.opendota.com/matches/{r['match_id']}'>match</a>{mmr_part}"
-        )
-    await cb.message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
-    await cb.answer()
-
-# ----- Герои (сортировки) -----
-def kda_calc(k,d,a) -> float:
-    return round((k+a)/max(1,d), 2)
-
-async def render_heroes(cb: CallbackQuery, sort_by: str):
-    u = db_get_user(cb.from_user.id)
-    if not u or not u.get("steam32"):
-        await cb.message.answer("Сначала привяжи аккаунт.", reply_markup=main_menu(False)); await cb.answer(); return
-    steam32 = u["steam32"]
-
-    async with aiohttp.ClientSession() as sess:
-        heroes_map = await fetch_heroes_map(sess)
-        data = await fetch_player_heroes(sess, steam32)
-
-    if not data:
-        await cb.message.answer("Нет данных по героям (возможен приватный профиль)."); await cb.answer(); return
-
-    rows = []
-    for it in data:
-        games = it.get("games",0) or 0
-        wins = it.get("win",0) or 0
-        k = it.get("k",0) or 0
-        d = it.get("d",0) or 0
-        a = it.get("a",0) or 0
-        wr = (wins/games*100) if games else 0.0
-        rows.append({
-            "hero": heroes_map.get(it.get("hero_id"), f"Hero {it.get('hero_id')}"),
-            "games": games, "wins": wins, "wr": wr, "kda": kda_calc(k,d,a)
-        })
-
-    if sort_by == "games":
-        rows.sort(key=lambda x: x["games"], reverse=True)
-        header = "играм"
-    elif sort_by == "wr":
-        rows = [r for r in rows if r["games"] >= 10]
-        rows.sort(key=lambda x: (x["wr"], x["games"]), reverse=True)
-        header = "винрейту"
-    else:  # kda
-        rows = [r for r in rows if r["games"] >= 10]
-        rows.sort(key=lambda x: (x["kda"], x["games"]), reverse=True)
-        header = "KDA"
-
-    top = rows[:15]
-    lines = [f"🧙 <b>Герои — топ 15 по {header}</b>"]
-    for i, r in enumerate(top, 1):
-        lines.append(f"{i}) {r['hero']} — игр: {r['games']}, WR: {r['wr']:.0f}%, KDA: {r['kda']:.2f}")
-    await cb.message.answer("\n".join(lines), parse_mode="HTML")
-
-@dp.callback_query(F.data == "heroes_menu")
-async def heroes_menu(cb: CallbackQuery):
-    await cb.message.answer("Выбери:", reply_markup=heroes_keyboard()); await cb.answer()
-
-@dp.callback_query(F.data == "heroes_sort_games")
-async def heroes_games(cb: CallbackQuery):
-    await render_heroes(cb, "games"); await cb.answer()
-
-@dp.callback_query(F.data == "heroes_sort_wr")
-async def heroes_wr(cb: CallbackQuery):
-    await render_heroes(cb, "wr"); await cb.answer()
-
-@dp.callback_query(F.data == "heroes_sort_kda")
-async def heroes_kda(cb: CallbackQuery):
-    await render_heroes(cb, "kda"); await cb.answer()
-
-# ----- Герой-аналитика (WR и NetWorth) -----
-@dp.callback_query(F.data == "heroes_analytics")
-async def heroes_analytics(cb: CallbackQuery):
-    u = db_get_user(cb.from_user.id)
-    if not u or not u.get("steam32"):
-        await cb.message.answer("Сначала привяжи аккаунт.", reply_markup=main_menu(False)); await cb.answer(); return
-    steam32 = u["steam32"]
-
-    async with aiohttp.ClientSession() as sess:
-        heroes_map = await fetch_heroes_map(sess)
-
-    agg = db_hero_agg(steam32)
-    if not agg:
-        await cb.message.answer("Недостаточно данных (сыграй пару матчей, чтобы собрать Net Worth)."); await cb.answer(); return
-
-    # топ WR (>=10 игр)
-    wr_list = []
-    for row in agg:
-        g = row["games"]; w = row["wins"]
-        if g >= 10:
-            wr = (w/g)*100
-            wr_list.append((heroes_map.get(row["hero_id"], f"Hero {row['hero_id']}"), g, wr))
-    wr_list.sort(key=lambda x: (x[2], x[1]), reverse=True)
-    wr_text = ["🏅 <b>Топ героев по винрейту (≥10 игр)</b>"] + [
-        f"{i+1}) {h} — WR: {wr:.0f}% (игр: {g})" for i,(h,g,wr) in enumerate(wr_list[:10])
-    ]
-
-    # топ по среднему Net Worth
-    nw_list = []
-    for row in agg:
-        if row["games"] >= 5:
-            nw = row["avg_nw"] or 0
-            nw_list.append((heroes_map.get(row["hero_id"], f"Hero {row['hero_id']}"), row["games"], nw))
-    nw_list.sort(key=lambda x: (x[2], x[1]), reverse=True)
-    nw_text = ["💰 <b>Топ героев по среднему Net Worth (≥5 игр)</b>"] + [
-        f"{i+1}) {h} — NW: {nw:.0f} (игр: {g})" for i,(h,g,nw) in enumerate(nw_list[:10])
-    ]
-
-    await cb.message.answer("\n".join(wr_text + [""] + nw_text), parse_mode="HTML")
-    await cb.answer()
-
-# ----- График активности -----
-@dp.callback_query(F.data == "activity")
-async def on_activity(cb: CallbackQuery):
-    u = db_get_user(cb.from_user.id)
-    if not u or not u.get("steam32"):
-        await cb.message.answer("Сначала привяжи аккаунт.", reply_markup=main_menu(False)); await cb.answer(); return
-    steam32 = u["steam32"]
-
-    async with aiohttp.ClientSession() as sess:
-        matches = await fetch_last_matches(sess, steam32, limit=200, ranked_only=False)
-
-    if not matches:
-        await cb.message.answer("Пока нет матчей."); await cb.answer(); return
-
-    by_day: Dict[str, int] = {}
-    for m in matches:
-        dt = datetime.fromtimestamp(m["start_time"], tz=timezone.utc) + timedelta(hours=MSK_OFFSET_HOURS)
-        day = dt.strftime("%Y-%m-%d")
-        by_day[day] = by_day.get(day, 0) + 1
-
-    days_sorted = sorted(by_day.items())
-    days_tail = days_sorted[-7:]
-    labels = [d for d,_ in days_tail]
-    values = [c for _,c in days_tail]
-
-    fig, ax = plt.subplots(figsize=(7,4))
-    ax.plot(labels, values, marker="o")
-    ax.set_title("Активность: игр в день (последние 7)")
-    ax.set_xlabel("Дата")
-    ax.set_ylabel("Игры")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    img_path = f"activity_{steam32}.png"
-    fig.savefig(img_path); plt.close(fig)
-
-    total = sum(values)
-    avg = total/len(values) if values else 0
-    top_day = max(values) if values else 0
-    caption = (
-        f"📈 <b>Активность за {len(values)} дн.</b>\n"
-        f"• Всего игр: <b>{total}</b>\n"
-        f"• В среднем в день: <b>{avg:.1f}</b>\n"
-        f"• Пик за день: <b>{top_day}</b>\n"
-    )
-    await bot.send_photo(cb.message.chat.id, FSInputFile(img_path), caption=caption, parse_mode="HTML",
-                         reply_markup=charts_keyboard())
-    try: os.remove(img_path)
-    except Exception: pass
-    await cb.answer()
-
-# ----- График тренда MMR -----
-@dp.callback_query(F.data == "mmr_trend")
-async def on_mmr_trend(cb: CallbackQuery):
-    u = db_get_user(cb.from_user.id)
-    if not u or not u.get("steam32"):
-        await cb.message.answer("Сначала привяжи аккаунт.", reply_markup=main_menu(False)); await cb.answer(); return
-    steam32 = u["steam32"]
-    rows = db_last_matches(steam32, 60)  # до 60 последних
-    pts = [(r["start_time"], r["mmr_after"]) for r in rows if r["lobby_type"]==7 and r["mmr_after"] is not None]
-    pts = sorted(set(pts))
-    if not pts:
-        await cb.message.answer("Недостаточно данных для графика (сыграй ranked-матчи)."); await cb.answer(); return
-
-    xs = [datetime.fromtimestamp(t, tz=timezone.utc) + timedelta(hours=MSK_OFFSET_HOURS) for t,_ in pts]
-    ys = [y for _,y in pts]
-    fig, ax = plt.subplots(figsize=(7,4))
-    ax.plot(xs, ys, marker="o")
-    ax.set_title("Тренд MMR (ranked)")
-    ax.set_xlabel("Дата")
-    ax.set_ylabel("MMR")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    fig.autofmt_xdate()
-    plt.tight_layout()
-    img_path = f"mmr_{steam32}.png"
-    fig.savefig(img_path); plt.close(fig)
-
-    caption = f"📉 <b>Тренд MMR</b>\nТочек: <b>{len(ys)}</b> | Текущий: <b>{ys[-1]}</b>"
-    await bot.send_photo(cb.message.chat.id, FSInputFile(img_path), caption=caption, parse_mode="HTML",
-                         reply_markup=charts_keyboard())
-    try: os.remove(img_path)
-    except Exception: pass
-    await cb.answer()
-
-# ----- Винрейт по ролям -----
-@dp.callback_query(F.data == "role_wr")
-async def on_role_wr(cb: CallbackQuery):
-    u = db_get_user(cb.from_user.id)
-    if not u or not u.get("steam32"):
-        await cb.message.answer("Сначала привяжи аккаунт.", reply_markup=main_menu(False)); await cb.answer(); return
-    steam32 = u["steam32"]
-    stat = db_role_wr(steam32)
-    core = stat["core"]; sup = stat["support"]
-    core_wr = round(100*core["w"]/core["g"]) if core["g"] else 0
-    sup_wr = round(100*sup["w"]/sup["g"]) if sup["g"] else 0
-    txt = (
-        "🎭 <b>Винрейт по ролям</b>\n"
-        f"• Core — игр: <b>{core['g']}</b>, побед: <b>{core['w']}</b>, WR: <b>{core_wr}%</b>\n"
-        f"• Support — игр: <b>{sup['g']}</b>, побед: <b>{sup['w']}</b>, WR: <b>{sup_wr}%</b>\n"
-        "Примечание: роль определяется эвристически по GPM и ключевым предметам."
-    )
-    await cb.message.answer(txt, parse_mode="HTML"); await cb.answer()
-
-# ----- AI совет -----
-SILENCE_HEROES = {75, 43, 35, 22, 15}  # примеры
-MAGIC_NUKERS = {25,31,74,62,66,101}
-PHY_DPS = {8,99,114,95}
-ILLUSION_CORES = {12,19,111}
-
-def ai_suggest(items: List[str], enemies: List[int], role_hint: str) -> List[str]:
-    s = set(items or [])
-    tips = []
-    def want(name, cond=True):
-        if cond and (name not in s):
-            tips.append(name)
-    if SILENCE_HEROES & set(enemies):
-        want("Black King Bar (BKB)")
-        want("Manta Style", role_hint in ("carry","mid"))
-        want("Lotus Orb", role_hint in ("offlane","support"))
-    if MAGIC_NUKERS & set(enemies):
-        want("Hood of Defiance / Pipe")
-        want("BKB")
-    if PHY_DPS & set(enemies):
-        want("Force Staff")
-        want("Ghost Scepter / E-Blade", role_hint in ("support","mid"))
-        want("Shiva's Guard / Assault Cuirass", role_hint in ("offlane","carry"))
-        want("Heaven's Halberd", role_hint in ("offlane","support"))
-    if ILLUSION_CORES & set(enemies):
-        want("Maelstrom / Battle Fury / Cleave")
-        want("Crimson Guard / Radiance (ситуативно)")
-    want("Wards / Dust", role_hint=="support")
-    if not tips: tips.append("Сборка ок 👍 (по базовым правилам)")
-    return tips[:8]
-
-@dp.callback_query(F.data == "ai_last")
-async def on_ai_last(cb: CallbackQuery):
-    u = db_get_user(cb.from_user.id)
-    if not u or not u.get("steam32"):
-        await cb.message.answer("Сначала привяжи аккаунт.", reply_markup=main_menu(False)); await cb.answer(); return
-    steam32 = u["steam32"]
-    last_match_id = u.get("last_any_match_id")
-    if not last_match_id:
-        await cb.message.answer("Пока нет последнего матча."); await cb.answer(); return
-
-    async with aiohttp.ClientSession() as sess:
-        detail = await fetch_match_detail(sess, last_match_id)
-        heroes_map = await fetch_heroes_map(sess)
-
-    if not detail or "players" not in detail:
-        await cb.message.answer("Не удалось получить детали матча."); await cb.answer(); return
-
-    you = next((p for p in detail["players"] if p.get("account_id")==int(steam32)), None)
-    if not you:
-        await cb.message.answer("В деталях матча нет твоих данных."); await cb.answer(); return
-
-    your_slot = you.get("player_slot", 0)
-    your_team_radiant = your_slot < 128
-    enemies = [p.get("hero_id") for p in detail["players"] if ((p.get("player_slot",0)<128) != your_team_radiant)]
-    purchases = [log.get("key","") for log in you.get("purchase_log", [])]
-    role = guess_role(purchases, you.get("gold_per_min",0) or 0)
-    tips = ai_suggest(purchases, enemies, role)
-    enemy_list = ", ".join(heroes_map.get(h, f"Hero {h}") for h in enemies)
-    txt = (
-        "🤖 <b>Совет по сборке (последний матч)</b>\n"
-        f"Роль: <b>{role}</b>\n"
-        f"Противники: {enemy_list}\n"
-        "Рекомендации:\n• " + "\n• ".join(tips) + "\n\n"
-        f"<a href='https://www.opendota.com/matches/{last_match_id}'>Открыть матч</a>"
-    )
-    await cb.message.answer(txt, parse_mode="HTML", disable_web_page_preview=True)
-    await cb.answer()
-
-# ========= BACKGROUND: polling + daily summary =========
-async def send_match_card(chat_id: int, heroes_map: Dict[int,str], m: dict,
-                          mmr_after: Optional[int], delta_mmr: Optional[int]):
-    hero = heroes_map.get(m.get("hero_id"), f"Hero {m.get('hero_id')}")
-    win = is_win(m.get("player_slot",0), bool(m.get("radiant_win")))
-    outcome = "✅ Победа" if win else "❌ Поражение"
-    kdastr = kda_str(m.get("kills",0), m.get("deaths",0), m.get("assists",0))
-    when = ts_msk_str(m.get("start_time",0))
-    dur = fmt_duration(m.get("duration",0))
-    mode = f"{lobby_name(m.get('lobby_type'))} | {game_mode_name(m.get('game_mode'))}"
-
-    mmr_line = ""
-    if m.get("lobby_type") == 7 and (mmr_after is not None) and (delta_mmr is not None):
-        arrow = "▲" if delta_mmr > 0 else "▼" if delta_mmr < 0 else "•"
-        mmr_line = f"\n📈 Изменение: {arrow} {delta_mmr:+d}\n📊 Текущий рейтинг: <b>{mmr_after}</b>"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Открыть матч в OpenDota", url=f"https://www.opendota.com/matches/{m.get('match_id')}")],
-        [InlineKeyboardButton(text="🤖 Совет по сборке", callback_data="ai_last")]
-    ])
-
-    text = (
-        "🎮 <b>Новая игра</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📅 {when}\n"
-        f"🧩 Режим: <b>{mode}</b>\n"
-        f"🧙 Герой: <b>{hero}</b>\n"
-        f"⚔️ {kdastr}  ⏱ {dur}\n"
-        f"🏆 Итог: {outcome}"
-        f"{mmr_line}\n"
-        "━━━━━━━━━━━━━━━━━━"
-    )
-    await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
-
-async def poll_worker():
-    await asyncio.sleep(3)
-    while True:
-        try:
-            users = db_get_users_with_steam()
-            if not users:
-                await asyncio.sleep(POLL_INTERVAL_SEC); continue
-
-            async with aiohttp.ClientSession() as sess:
-                heroes_map = await fetch_heroes_map(sess)
-                for u in users:
-                    steam32 = u["steam32"]; tg = u["telegram_id"]
-
-                    # трекаем rank_tier для rank up/down
-                    player = await fetch_player(sess, steam32)
-                    rank_tier = (player or {}).get("rank_tier")
-                    if rank_tier is not None:
-                        prev = u.get("last_rank_tier")
-                        if prev is not None and prev != rank_tier:
-                            direction = "⬆️ Ранг ап!" if rank_tier > prev else "⬇️ Ранг даун..."
-                            await bot.send_message(tg, f"🏅 {direction} Теперь: <b>{rank_name(rank_tier)}</b>", parse_mode="HTML")
-                        db_set_last_rank_tier(tg, rank_tier)
-                        # обновим авто-MMR
-                        auto_mmr = mmr_from_rank_tier(rank_tier)
-                        if auto_mmr is not None:
-                            db_update_auto_mmr(tg, auto_mmr)
-
-                    # последняя игра любого режима
-                    arr_any = await fetch_last_matches(sess, steam32, limit=1, ranked_only=False)
-                    if arr_any:
-                        m = arr_any[0]
-                        mid = m["match_id"]
-                        if u.get("last_any_match_id") != mid:
-                            detail = await fetch_match_detail(sess, mid)
-                            nw = gpm = None
-                            role = "core"
-                            if detail and "players" in detail:
-                                you = next((p for p in detail["players"] if p.get("account_id")==int(steam32)), None)
-                                if you:
-                                    nw = you.get("net_worth")
-                                    gpm = you.get("gold_per_min")
-                                    purchases = [log.get("key","") for log in you.get("purchase_log", [])]
-                                    role = guess_role(purchases, gpm or 0)
-
-                            # дельта MMR — только для ranked; применяем к «эффективному» источнику
-                            delta = None
-                            mmr_after = None
-                            if m.get("lobby_type") == 7:
-                                cur_user = db_get_user(tg)
-                                curr = effective_mmr(cur_user)
-                                if isinstance(curr, int):
-                                    win = is_win(m.get("player_slot",0), m.get("radiant_win",False))
-                                    delta = ASSUMED_MMR_DELTA if win else -ASSUMED_MMR_DELTA
-                                    mmr_after = curr + delta
-                                    if cur_user.get("user_set_mmr") is not None:
-                                        db_set_user_mmr(tg, mmr_after)
-                                    else:
-                                        db_update_auto_mmr(tg, mmr_after)
-
-                            db_upsert_match(steam32, m, nw, gpm, role, delta, mmr_after)
-                            db_set_last_match_ids(tg, any_id=mid)
-
-                            # карточка матча
-                            await send_match_card(tg, heroes_map, m, mmr_after, delta)
-
-                            # streak notify
-                            sdir = db_calc_streak_dir(steam32)
-                            if sdir >= STREAK_NOTIFY_WIN:
-                                await bot.send_message(tg, f"🔥 Винстрик: {sdir} подряд! Так держать!")
-                            elif -sdir >= STREAK_NOTIFY_LOSE:
-                                await bot.send_message(tg, f"💀 Лузстрик: {-sdir} подряд. Передохни или соберись 💪")
-
-                    # последняя ranked
-                    arr_ranked = await fetch_last_matches(sess, steam32, limit=1, ranked_only=True)
-                    if arr_ranked:
-                        mid_r = arr_ranked[0]["match_id"]
-                        if u.get("last_ranked_match_id") != mid_r:
-                            db_set_last_match_ids(tg, ranked_id=mid_r)
-
-        except Exception as e:
-            logging.warning(f"poll_worker error: {e}")
-        await asyncio.sleep(POLL_INTERVAL_SEC)
-
-def seconds_until_2359_msk() -> int:
-    now_utc = datetime.now(timezone.utc)
-    now_msk = now_utc + timedelta(hours=MSK_OFFSET_HOURS)
-    target = now_msk.replace(hour=23, minute=59, second=0, microsecond=0)
-    if target <= now_msk:
-        target += timedelta(days=1)
-    return max(5, int((target - now_msk).total_seconds()))
-
-def db_get_users_with_steam() -> List[dict]:
+def db_get_all_users_with_steam() -> List[Dict[str,Any]]:
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.row_factory = sqlite3.Row
         rs = con.execute("SELECT * FROM users WHERE steam32 IS NOT NULL").fetchall()
         return [dict(r) for r in rs]
 
-async def daily_summary_worker():
+def db_sum_delta_mmr_today(steam32:str, start_ts:int, end_ts:int) -> int:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        r = con.execute("""
+            SELECT SUM(COALESCE(delta_mmr,0)) s FROM matches
+            WHERE steam32=? AND lobby_type=7 AND start_time BETWEEN ? AND ?
+        """, (steam32, start_ts, end_ts)).fetchone()
+        return int(r["s"]) if r and r["s"] is not None else 0
+
+def db_role_wr(steam32:str) -> Dict[str,Dict[str,int]]:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        rs = con.execute("SELECT role, radiant_win, player_slot FROM matches WHERE steam32=? AND role IS NOT NULL", (steam32,)).fetchall()
+    stat = {"core":{"g":0,"w":0}, "support":{"g":0,"w":0}}
+    for r in rs:
+        role = r["role"]
+        if role not in stat: continue
+        win = ((r["player_slot"]<128) and (r["radiant_win"]==1)) or ((r["player_slot"]>=128) and (r["radiant_win"]==0))
+        stat[role]["g"] += 1
+        if win: stat[role]["w"] += 1
+    return stat
+
+def db_hero_aggregates(steam32:str) -> List[Dict[str,Any]]:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        rs = con.execute("""
+        SELECT hero_id, COUNT(*) games,
+               SUM(CASE WHEN ((player_slot<128 AND radiant_win=1) OR (player_slot>=128 AND radiant_win=0)) THEN 1 ELSE 0 END) wins,
+               AVG(COALESCE(net_worth,0)) avg_nw
+        FROM matches WHERE steam32=? GROUP BY hero_id ORDER BY games DESC
+        """, (steam32,)).fetchall()
+        return [dict(r) for r in rs]
+
+# ---------------- CACHING (in-memory) ----------------
+_open_dota_cache: Dict[str, Tuple[float, Any]] = {}  # key -> (ts, data)
+
+async def od_get(path:str, params:dict=None, use_cache:bool=True):
+    """
+    GET helper with simple TTL caching
+    """
+    key = path + (f"?{json.dumps(params, sort_keys=True)}" if params else "")
+    now = time.time()
+    if use_cache and key in _open_dota_cache:
+        ts, data = _open_dota_cache[key]
+        if now - ts < CACHE_TTL:
+            return data
+    url = OPEN_DOTA + path
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params=params, timeout=25) as r:
+                if r.status == 404:
+                    data = None
+                else:
+                    r.raise_for_status()
+                    data = await r.json()
+    except Exception as e:
+        logger.warning("OpenDota request failed: %s %s", url, e)
+        data = None
+    _open_dota_cache[key] = (now, data)
+    return data
+
+# convenience wrappers
+async def od_player(steam32:int): return await od_get(f"/players/{steam32}")
+async def od_matches(steam32:int, limit:int=10, params:dict=None): return await od_get(f"/players/{steam32}/matches", params={**({"limit":limit} if limit else {}), **(params or {})})
+async def od_recent(steam32:int): return await od_get(f"/players/{steam32}/recentMatches")
+async def od_heroes_map(): return await od_get("/heroes")
+async def od_player_heroes(steam32:int): return await od_get(f"/players/{steam32}/heroes")
+async def od_wl(steam32:int): return await od_get(f"/players/{steam32}/wl")
+async def od_match_detail(match_id:int): return await od_get(f"/matches/{match_id}", use_cache=False)
+
+# ---------------- HELPERS ----------------
+STEAM_PROFILE_RE = re.compile(r"(?:https?://)?steamcommunity\.com/(?:id|profiles)/([^/\s]+)", re.I)
+STEAM64_OFFSET = 76561197960265728
+
+def parse_steam_any(text:str) -> Optional[int]:
+    text = (text or "").strip()
+    m = STEAM_PROFILE_RE.search(text)
+    if m:
+        part = m.group(1)
+        # if numeric it's steam64
+        if part.isdigit() and len(part) >= 16:
+            return int(part) - STEAM64_OFFSET
+        # vanity names can't be resolved without Steam Web API key; ask user to send profiles/<steam64>
+        return None
+    if text.isdigit():
+        if len(text) >= 16:
+            return int(text) - STEAM64_OFFSET
+        return int(text)
+    return None
+
+def fmt_duration(sec:int) -> str:
+    sec = int(max(0, sec or 0))
+    mm, ss = divmod(sec, 60)
+    hh, mm = divmod(mm, 60)
+    return f"{hh}:{mm:02d}:{ss:02d}" if hh else f"{mm}:{ss:02d}"
+
+def ts_msk(ts:int) -> str:
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc) + timedelta(hours=MSK_OFFSET)
+    return dt.strftime("%d.%m.%Y %H:%M МСК")
+
+def is_player_win(player_slot:int, radiant_win:bool) -> bool:
+    rad = player_slot < 128
+    return (rad and radiant_win) or ((not rad) and (not radiant_win))
+
+def safe_kda(k,d,a) -> float:
+    return round(( (k or 0) + (a or 0) ) / max(1, (d or 0)), 2)
+
+def hero_name_from_map(hero_id:int, heroes_map:List[dict]) -> str:
+    for h in heroes_map:
+        if h.get("id")==hero_id:
+            return h.get("localized_name") or f"Hero {hero_id}"
+    return f"Hero {hero_id}"
+
+def lobby_name(lobby:int) -> str:
+    table = {0:"Unranked",1:"Practice",2:"Tournament",3:"Tutorial",4:"Co-op Bots",5:"Ranked Team",6:"Ranked Solo",7:"Ranked",8:"1v1 Mid",9:"Battle Cup"}
+    return table.get(lobby, "Custom/Unknown")
+
+def game_mode_name(mode:int, gm_map:dict) -> str:
+    # gm_map from OPEN_DOTA /constants/game_mode might be present; fallback to integer map
+    fallback = {1:"All Pick",2:"Captains Mode",3:"Random Draft",4:"Single Draft",5:"All Random",12:"Least Played",13:"Limited Heroes",14:"Compendium",15:"Custom",16:"Captains Draft",17:"Balanced Draft",18:"Ability Draft",19:"Event",20:"ARDM",21:"1v1 Mid",22:"All Draft",23:"Turbo"}
+    # gm_map keys are like '1': {'id':1,'name':'game_mode_all_pick'...}
+    if gm_map:
+        for k,v in gm_map.items():
+            try:
+                if int(v.get("id",-1)) == mode:
+                    return v.get("name","").replace("game_mode_","").replace("_"," ").title()
+            except Exception:
+                pass
+    return fallback.get(mode, f"Mode {mode}")
+
+def approx_mmr_from_rank_tier(rank_tier:Optional[int]) -> Optional[int]:
+    if not isinstance(rank_tier, int): return None
+    base = {1:0,2:600,3:1200,4:1800,5:2600,6:3400,7:4400,8:5400}
+    major = rank_tier // 10
+    minor = rank_tier % 10
+    if major not in base: return None
+    if major == 8:
+        return base[major]
+    return base[major] + (minor-1)*200
+
+def mmr_progress_text(rank_tier:Optional[int], exact_mmr:Optional[int]) -> Optional[str]:
+    if exact_mmr is None:
+        return None
+    if not isinstance(rank_tier, int):
+        return None
+    curr_est = approx_mmr_from_rank_tier(rank_tier)
+    if curr_est is None:
+        return None
+    next_border = curr_est + 200
+    need = max(0, next_border - exact_mmr)
+    return f"до следующей звезды ≈ {need} MMR"
+
+# role guess
+def guess_role_from_purchase_and_gpm(purchase_keys:List[str], gpm:int) -> str:
+    core_items = {"bkb","manta","daedalus","skadi","desolator","battle_fury","butterfly","radiance","satanic"}
+    support_items = {"mekansm","glimmer_cape","force_staff","guardian_greaves","lotus_orb","pipe","urn_of_shadows","spirit_vessel"}
+    s = set(purchase_keys or [])
+    if gpm and gpm >= 420: return "core"
+    if any(x in s for x in core_items): return "core"
+    if any(x in s for x in support_items): return "support"
+    # default based on gpm:
+    if gpm and gpm < 350: return "support"
+    return "core"
+
+# ---------------- UI (keyboards) ----------------
+def build_main_kb(bound:bool):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(text="🏆 Статус", callback_data="status"),
+        InlineKeyboardButton(text="🎮 Последние матчи", callback_data="last_games")
+    )
+    kb.add(
+        InlineKeyboardButton(text="🧙 Герои", callback_data="heroes_menu"),
+        InlineKeyboardButton(text="📈 Активность", callback_data="activity")
+    )
+    kb.add(
+        InlineKeyboardButton(text="📉 Тренд MMR", callback_data="mmr_trend"),
+        InlineKeyboardButton(text="⚙ Привязать / Сменить Steam", callback_data="bind")
+    )
+    kb.add(InlineKeyboardButton(text=("🔁 Указать точный MMR" if bound else "🔗 Указать точный MMR"), callback_data="set_mmr"))
+    return kb
+
+def heroes_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🔝 По играм", callback_data="heroes_games"),
+        InlineKeyboardButton("✅ По WR", callback_data="heroes_wr")
+    )
+    kb.add(
+        InlineKeyboardButton("⚔ По KDA", callback_data="heroes_kda"),
+        InlineKeyboardButton("🧠 Аналитика героев", callback_data="heroes_analytics")
+    )
+    kb.add(InlineKeyboardButton("⬅ Назад", callback_data="back_main"))
+    return kb
+
+def charts_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📊 Активность (7д)", callback_data="activity"),
+        InlineKeyboardButton("📉 Тренд MMR", callback_data="mmr_trend")
+    )
+    kb.add(
+        InlineKeyboardButton("🎭 Винрейт по ролям", callback_data="role_wr"),
+        InlineKeyboardButton("⬅ Назад", callback_data="back_main")
+    )
+    return kb
+
+# ---------------- Handlers ----------------
+
+# start / main menu
+@dp.message(Command("start"))
+async def cmd_start(msg: Message):
+    init_db()
+    user = db_get_user(msg.from_user.id)
+    bound = bool(user and user.get("steam32"))
+    await msg.answer("Привет! Я Dota 2 трекер — выбери действие:", reply_markup=build_main_kb(bound))
+
+# bind steam
+@dp.callback_query(lambda c: c.data == "bind")
+async def cb_bind(cq: CallbackQuery):
+    await cq.message.answer("Пришли Steam ID (steam32/steam64) или ссылку вида https://steamcommunity.com/profiles/7656...")
+    await cq.answer()
+
+@dp.message()
+async def msg_handle(m: Message):
+    """
+    This message handler covers:
+    - binding Steam if message looks like Steam id or url (and user clicked bind)
+    - 'mmr 4321' to set exact mmr
+    Otherwise ignored (we don't spam)
+    """
+    txt = (m.text or "").strip()
+    if not txt:
+        return
+
+    # mmr input
+    mmr_match = re.match(r"^\s*mmr\s*[:=]?\s*(\d{2,5})\s*$", txt, re.I) or re.match(r"^\s*mmr(\d{2,5})\s*$", txt, re.I)
+    if mmr_match:
+        mmr_val = int(mmr_match.group(1))
+        if mmr_val <= 0 or mmr_val > 30000:
+            await m.reply("Неправильное значение MMR.")
+            return
+        init_db()
+        db_update_exact_mmr(m.from_user.id, mmr_val)
+        # also update max_mmr if needed
+        u = db_get_user(m.from_user.id)
+        if u:
+            max_mm = u.get("max_mmr") or 0
+            if mmr_val > max_mm:
+                with closing(sqlite3.connect(DB_PATH)) as con:
+                    con.execute("UPDATE users SET max_mmr=? WHERE telegram_id=?", (mmr_val, m.from_user.id))
+                    con.commit()
+        await m.reply(f"✅ Точный MMR сохранён: {mmr_val}")
+        return
+
+    # steam binding detection
+    if "steamcommunity.com" in txt or txt.isdigit():
+        steam32 = parse_steam_any(txt)
+        if steam32 is None:
+            await m.reply("Не удалось распознать Steam ID. Отправь ссылку вида /profiles/7656... или числовой steam64/steam32.")
+            return
+        init_db()
+        # verify with OpenDota
+        pl = await od_player(steam32)
+        if not pl or not pl.get("profile"):
+            await m.reply("Профиль не найден в OpenDota. Убедись, что профиль доступен и ты входил в OpenDota ранее.")
+            return
+        db_set_user_steam(m.from_user.id, steam32)
+        # set initial auto mmr
+        rank_tier = pl.get("rank_tier")
+        est = approx_mmr_from_rank_tier(rank_tier)
+        if est:
+            db_update_auto_mmr(m.from_user.id, est)
+            db_set_last_rank_tier(m.from_user.id, rank_tier)
+        await m.reply(f"✅ Привязан Steam32: {steam32}. Используй меню.", reply_markup=build_main_kb(True))
+        return
+
+    # otherwise ignore (or respond help)
+    # await m.reply("Не понимаю. Для привязки Steam нажми кнопку 'Привязать Steam' или пришли 'mmr 4321' чтобы указать MMR.")
+
+# back to main
+@dp.callback_query(lambda c: c.data == "back_main")
+async def cb_back_main(cq: CallbackQuery):
+    user = db_get_user(cq.from_user.id)
+    bound = bool(user and user.get("steam32"))
+    await cq.message.edit_text("Главное меню:", reply_markup=build_main_kb(bound))
+    await cq.answer()
+
+# set mmr via button
+@dp.callback_query(lambda c: c.data == "set_mmr")
+async def cb_set_mmr(cq: CallbackQuery):
+    await cq.message.answer("Пришли точный MMR как сообщение: <code>mmr 4321</code>", disable_web_page_preview=True)
+    await cq.answer()
+
+# STATUS
+@dp.callback_query(lambda c: c.data == "status")
+async def cb_status(cq: CallbackQuery):
+    init_db()
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Сначала привяжи Steam (кнопка Привязать / Сменить Steam).")
+        await cq.answer()
+        return
+    loading = await cq.message.answer("⏳ Загружаю статус...")
+    steam32 = int(u["steam32"])
+    # parallel fetch
+    heroes_map_task = od_heroes_map()
+    gm_task = od_get("/constants/game_mode")
+    player_task = od_player(steam32)
+    recent_task = od_recent(steam32)
+    heroes_map, gm_map, player, recent = await asyncio.gather(heroes_map_task, gm_task, player_task, recent_task)
+    rank_tier = player.get("rank_tier") if player else None
+    rank_str = (lambda x: "—" if not x else ( "Immortal" if x//10==8 else f"{['Herald','Guardian','Crusader','Archon','Legend','Ancient','Divine','Immortal'][x//10 -1]} {x%10}"))(rank_tier)
+    approx_mmr = approx_mmr_from_rank_tier(rank_tier)
+    exact_mmr = u.get("exact_mmr") or None
+    auto_mmr = u.get("current_mmr") or approx_mmr
+
+    mmr_text = f"{exact_mmr} (точный)" if exact_mmr else (f"~{auto_mmr} (оценка)" if auto_mmr else "—")
+    prog = mmr_progress_text(rank_tier, exact_mmr)
+
+    last_info = "—"
+    if recent and isinstance(recent, list) and len(recent)>0:
+        r = recent[0]
+        gm_name = game_mode_name(r.get("game_mode",-1), gm_map or {})
+        # compute win properly
+        ps = r.get("player_slot",0)
+        radiant_win = bool(r.get("radiant_win"))
+        win = "✅ Победа" if is_player_win(ps, radiant_win) else "❌ Поражение"
+        last_info = f"{ts_msk(r.get('start_time'))}\n{gm_name} | {win} | {r.get('kills',0)}/{r.get('deaths',0)}/{r.get('assists',0)}\n<a href='{OPEN_DOTA}/matches/{r.get('match_id')}'>OpenDota</a>"
+
+    text_lines = [
+        "<b>🏆 Статус аккаунта</b>",
+        f"👤 Ник: <b>{(player.get('profile') or {}).get('personaname','—') if player else '—'}</b>",
+        f"🆔 Steam32: <b>{steam32}</b>",
+        f"🏅 Ранг: <b>{rank_str}</b>",
+        f"📈 MMR: <b>{mmr_text}</b>" + (f"\n🧭 {prog}" if prog else ""),
+        f"🔝 Макс. MMR: <b>{u.get('max_mmr') or '—'}</b>",
+        f"🕓 Последний матч:\n{last_info}"
+    ]
+    await loading.edit_text("\n".join(text_lines), disable_web_page_preview=True, reply_markup=build_main_kb(True))
+    await cq.answer()
+
+# LAST ANY (single)
+@dp.callback_query(lambda c: c.data == "last_games")
+async def cb_last_any(cq: CallbackQuery):
+    init_db()
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Привяжи Steam сначала.")
+        await cq.answer()
+        return
+    steam32 = int(u["steam32"])
+    loading = await cq.message.answer("⏳ Получаю последние матчи...")
+    recent = await od_recent(steam32) or []
+    if not recent:
+        await loading.edit_text("Нет доступных последних матчей.", reply_markup=build_main_kb(True))
+        await cq.answer(); return
+
+    # show last 10 recent (all modes) summarised
+    heroes_map = await od_heroes_map() or []
+    gm_map = await od_get("/constants/game_mode") or {}
+    lines = ["<b>🎮 Последние 10 матчей (все режимы)</b>"]
+    for i,m in enumerate(recent[:10],1):
+        gm = game_mode_name(m.get("game_mode",-1), gm_map)
+        hero = hero_name_from_map(m.get("hero_id"), heroes_map)
+        ps = m.get("player_slot",0)
+        win = "✅" if is_player_win(ps, bool(m.get("radiant_win"))) else "❌"
+        kda = f"{m.get('kills',0)}/{m.get('deaths',0)}/{m.get('assists',0)} (KDA {safe_kda(m.get('kills',0),m.get('deaths',0),m.get('assists',0)):.2f})"
+        # if ranked, attempt to show delta mmr if in DB
+        ranked_str = ""
+        if m.get("lobby_type") == 7:
+            # search DB for this match
+            with closing(sqlite3.connect(DB_PATH)) as con:
+                con.row_factory = sqlite3.Row
+                r = con.execute("SELECT delta_mmr, mmr_after FROM matches WHERE steam32=? AND match_id=?", (str(steam32), m.get("match_id"))).fetchone()
+                if r and r["delta_mmr"] is not None:
+                    arrow = "▲" if r["delta_mmr"]>0 else ("▼" if r["delta_mmr"]<0 else "•")
+                    ranked_str = f" | {arrow} {r['delta_mmr']:+d} (MMR {r['mmr_after']})"
+        lines.append(f"{i}) {ts_msk(m.get('start_time'))} — {hero} — {gm} — {win} — {kda}{ranked_str} — <a href='{OPEN_DOTA}/matches/{m.get('match_id')}'>match</a>")
+    await loading.edit_text("\n".join(lines), disable_web_page_preview=True, reply_markup=build_main_kb(True))
+    await cq.answer()
+
+# LAST 10 RANKED
+@dp.callback_query(lambda c: c.data == "last_ranked")
+async def cb_last_ranked(cq: CallbackQuery):
+    init_db()
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Привяжи Steam сначала.")
+        await cq.answer()
+        return
+    steam32 = int(u["steam32"])
+    loading = await cq.message.answer("⏳ Получаю последние рейтинговые матчи...")
+    matches = await od_matches(steam32, limit=40) or []
+    ranked = [m for m in matches if m.get("lobby_type")==7]
+    ranked = ranked[:10]
+    if not ranked:
+        await loading.edit_text("Не найдено рейтинговых матчей.", reply_markup=build_main_kb(True))
+        await cq.answer(); return
+    lines = ["<b>🏆 Последние 10 рейтинговых матчей</b>"]
+    for i,m in enumerate(ranked,1):
+        gm = f"{lobby_name(m.get('lobby_type'))} | game_mode:{m.get('game_mode')}"
+        ps = m.get("player_slot",0)
+        win = is_player_win(ps, bool(m.get("radiant_win")))
+        res = "✅ Победа" if win else "❌ Поражение"
+        lines.append(f"{i}) {ts_msk(m.get('start_time'))} — {gm} — {res} — <a href='{OPEN_DOTA}/matches/{m.get('match_id')}'>match</a>")
+    await loading.edit_text("\n".join(lines), disable_web_page_preview=True, reply_markup=build_main_kb(True))
+    await cq.answer()
+
+# HEROES menu
+@dp.callback_query(lambda c: c.data == "heroes_menu")
+async def cb_heroes_menu(cq: CallbackQuery):
+    await cq.message.answer("Выбери сортировку героев:", reply_markup=heroes_kb())
+    await cq.answer()
+
+async def render_heroes_sorted(steam32:int, sort_by:str):
+    heroes_map = await od_heroes_map() or []
+    stats = await od_player_heroes(steam32) or []
+    rows = []
+    for s in stats:
+        games = s.get("games",0)
+        if games <= 0: continue
+        hid = s.get("hero_id")
+        k = s.get("k",0); d = s.get("d",0); a = s.get("a",0)
+        rows.append({
+            "hero": hero_name_from_map(hid, heroes_map),
+            "games": games,
+            "wr": (s.get("win",0)/games*100) if games else 0.0,
+            "kda": safe_kda(k,d,a)
+        })
+    if sort_by=="games":
+        rows.sort(key=lambda x:x["games"], reverse=True)
+    elif sort_by=="wr":
+        rows = [r for r in rows if r["games"]>=10]
+        rows.sort(key=lambda x:(x["wr"], x["games"]), reverse=True)
+    else:
+        rows = [r for r in rows if r["games"]>=10]
+        rows.sort(key=lambda x:(x["kda"], x["games"]), reverse=True)
+    return rows[:15]
+
+@dp.callback_query(lambda c: c.data == "heroes_games")
+async def cb_heroes_games(cq: CallbackQuery):
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Сначала привяжи Steam.")
+        await cq.answer(); return
+    steam32 = int(u["steam32"])
+    loading = await cq.message.answer("⏳ Загружаю статистику героев...")
+    top = await render_heroes_sorted(steam32, "games")
+    lines = ["🧙 <b>Топ 15 по играм</b>"]
+    for i,h in enumerate(top,1):
+        lines.append(f"{i}) {h['hero']} — игр: {h['games']}, WR: {h['wr']:.0f}%, KDA: {h['kda']:.2f}")
+    await loading.edit_text("\n".join(lines), disable_web_page_preview=True, reply_markup=build_main_kb(True))
+    await cq.answer()
+
+@dp.callback_query(lambda c: c.data == "heroes_wr")
+async def cb_heroes_wr(cq: CallbackQuery):
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Сначала привяжи Steam.")
+        await cq.answer(); return
+    steam32 = int(u["steam32"])
+    loading = await cq.message.answer("⏳ Загружаю статистику героев...")
+    top = await render_heroes_sorted(steam32, "wr")
+    lines = ["🧙 <b>Топ 15 по винрейту (≥10 игр)</b>"]
+    for i,h in enumerate(top,1):
+        lines.append(f"{i}) {h['hero']} — игр: {h['games']}, WR: {h['wr']:.0f}%, KDA: {h['kda']:.2f}")
+    await loading.edit_text("\n".join(lines), disable_web_page_preview=True, reply_markup=build_main_kb(True))
+    await cq.answer()
+
+@dp.callback_query(lambda c: c.data == "heroes_kda")
+async def cb_heroes_kda(cq: CallbackQuery):
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Сначала привяжи Steam.")
+        await cq.answer(); return
+    steam32 = int(u["steam32"])
+    loading = await cq.message.answer("⏳ Загружаю статистику героев...")
+    top = await render_heroes_sorted(steam32, "kda")
+    lines = ["🧙 <b>Топ 15 по KDA (≥10 игр)</b>"]
+    for i,h in enumerate(top,1):
+        lines.append(f"{i}) {h['hero']} — игр: {h['games']}, KDA: {h['kda']:.2f}, WR: {h['wr']:.0f}%")
+    await loading.edit_text("\n".join(lines), disable_web_page_preview=True, reply_markup=build_main_kb(True))
+    await cq.answer()
+
+@dp.callback_query(lambda c: c.data == "heroes_analytics")
+async def cb_heroes_analytics(cq: CallbackQuery):
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Сначала привяжи Steam.")
+        await cq.answer(); return
+    steam32 = int(u["steam32"])
+    loading = await cq.message.answer("⏳ Формирую аналитику героев...")
+    agg = db_hero_aggregates(str(steam32))
+    heroes_map = await od_heroes_map() or []
+    # WR top (>=10)
+    wrs = []
+    for a in agg:
+        g = a["games"]; w = a["wins"]
+        if g >= 10:
+            wrs.append((a["hero_id"], g, w, (w/g)*100, a["avg_nw"]))
+    wrs.sort(key=lambda x:(x[3], x[1]), reverse=True)
+    text = ["🏅 <b>Топ по винрейту (≥10 игр)</b>"]
+    for i, item in enumerate(wrs[:10],1):
+        hid, g, w, wrp, nw = item
+        text.append(f"{i}) {hero_name_from_map(hid, heroes_map)} — WR {wrp:.0f}% ({g} игр)")
+    # Networth top (>=5)
+    nwlist = [ (a["hero_id"], a["games"], a["avg_nw"]) for a in agg if a["games"]>=5 ]
+    nwlist.sort(key=lambda x:x[2], reverse=True)
+    text += ["", "💰 <b>Топ по среднему Net Worth (≥5 игр)</b>"]
+    for i, item in enumerate(nwlist[:10],1):
+        hid,g,nw = item
+        text.append(f"{i}) {hero_name_from_map(hid, heroes_map)} — NW {nw:.0f} (игр: {g})")
+    await loading.edit_text("\n".join(text), disable_web_page_preview=True, reply_markup=build_main_kb(True))
+    await cq.answer()
+
+# ACTIVITY chart (7 days)
+@dp.callback_query(lambda c: c.data == "activity")
+async def cb_activity(cq: CallbackQuery):
+    init_db()
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Привяжи Steam сначала.")
+        await cq.answer(); return
+    steam32 = int(u["steam32"])
+    loading = await cq.message.answer("⏳ Строю активность (7 дней)...")
+    recent = await od_recent(steam32) or []
+    # build 7 days list (MSK)
+    today_msk = (datetime.utcnow() + timedelta(hours=MSK_OFFSET)).date()
+    days = [(today_msk - timedelta(days=i)) for i in range(6,-1,-1)]
+    counts = {d:0 for d in days}
+    for m in recent:
+        ts = datetime.utcfromtimestamp(m.get("start_time",0)) + timedelta(hours=MSK_OFFSET)
+        d = ts.date()
+        if d in counts: counts[d] += 1
+    xs = [d.strftime("%d.%m") for d in days]
+    ys = [counts[d] for d in days]
+    fig, ax = plt.subplots(figsize=(7,3))
+    ax.bar(xs, ys)
+    ax.set_title("Активность: игр в день (последние 7 дн.)")
+    ax.set_xlabel("День"); ax.set_ylabel("Игры")
+    ax.grid(axis='y', alpha=0.3)
+    tmpf = f"/tmp/activity_{cq.from_user.id}.png"
+    fig.savefig(tmpf, bbox_inches='tight'); plt.close(fig)
+    total = sum(ys); avg = total/7.0
+    cap = f"📈 Активность за 7 дн.\n• Всего игр: {total}\n• В среднем/день: {avg:.1f}"
+    await bot.send_photo(cq.from_user.id, FSInputFile(tmpf), caption=cap)
+    try: os.remove(tmpf)
+    except: pass
+    await loading.delete()
+    await cq.answer()
+
+# MMR TREND chart
+@dp.callback_query(lambda c: c.data == "mmr_trend")
+async def cb_mmr_trend(cq: CallbackQuery):
+    init_db()
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Привяжи Steam сначала.")
+        await cq.answer(); return
+    steam32 = int(u["steam32"])
+    loading = await cq.message.answer("⏳ Строю тренд MMR по последним ranked...")
+    matches = await od_matches(steam32, limit=60) or []
+    ranked = [m for m in matches if m.get("lobby_type")==7]
+    ranked = ranked[::-1]  # old -> new for plotting
+    if not ranked:
+        await loading.edit_text("Недостаточно ранк-матчей для тренда.", reply_markup=build_main_kb(True))
+        await cq.answer(); return
+    # starting point: exact mmr if present else approx from rank tier or 0
+    exact = u.get("exact_mmr")
+    if exact is not None:
+        cur = exact
+    else:
+        # try current_mmr or approx
+        cur = u.get("current_mmr") or approx_mmr_from_rank_tier((await od_player(int(u["steam32"]))).get("rank_tier") if await od_player(int(u["steam32"])) else None) or 0
+    xs = []; ys = []
+    tmpcur = cur
+    for i,m in enumerate(ranked, start=1):
+        win = is_player_win(m.get("player_slot",0), bool(m.get("radiant_win")))
+        delta = ASSUMED_MMR_DELTA if win else -ASSUMED_MMR_DELTA
+        tmpcur = tmpcur + delta
+        xs.append(i); ys.append(tmpcur)
+    fig, ax = plt.subplots(figsize=(7,3))
+    ax.plot(xs, ys, marker='o')
+    ax.set_title("Тренд условного MMR (последние ранк)")
+    ax.set_xlabel("Матч"); ax.set_ylabel("MMR")
+    ax.grid(alpha=0.3)
+    tmpf = f"/tmp/mmr_{cq.from_user.id}.png"
+    fig.savefig(tmpf, bbox_inches='tight'); plt.close(fig)
+    cap = f"📉 Тренд MMR (условный). Точка старта: {cur}"
+    await bot.send_photo(cq.from_user.id, FSInputFile(tmpf), caption=cap)
+    try: os.remove(tmpf)
+    except: pass
+    await loading.delete()
+    await cq.answer()
+
+# ROLE WR
+@dp.callback_query(lambda c: c.data == "role_wr")
+async def cb_role_wr(cq: CallbackQuery):
+    init_db()
+    u = db_get_user(cq.from_user.id)
+    if not u or not u.get("steam32"):
+        await cq.message.answer("Привяжи Steam сначала.")
+        await cq.answer(); return
+    stats = db_role_wr(str(u["steam32"]))
+    core = stats["core"]; sup = stats["support"]
+    core_wr = round(100*core["w"]/core["g"]) if core["g"] else 0
+    sup_wr  = round(100*sup["w"]/sup["g"]) if sup["g"] else 0
+    text = f"🎭 <b>Винрейт по ролям</b>\n• Core: игр {core['g']}, побед {core['w']}, WR {core_wr}%\n• Support: игр {sup['g']}, побед {sup['w']}, WR {sup_wr}%"
+    await cq.message.answer(text, parse_mode="HTML")
+    await cq.answer()
+
+# ---------------- Background: Polling + Daily Summary ----------------
+async def send_match_card(to_tg:int, heroes_map:List[dict], m:dict, mmr_after:Optional[int], delta:Optional[int]):
+    hero = hero_name_from_map(m.get("hero_id"), heroes_map)
+    win = is_player_win(m.get("player_slot",0), bool(m.get("radiant_win")))
+    res = "✅ Победа" if win else "❌ Поражение"
+    kdastr = f"{m.get('kills',0)}/{m.get('deaths',0)}/{m.get('assists',0)} (KDA {safe_kda(m.get('kills',0),m.get('deaths',0),m.get('assists',0)):.2f})"
+    when = ts_msk(m.get("start_time",0))
+    dur = fmt_duration(m.get("duration",0))
+    mode_text = f"{lobby_name(m.get('lobby_type'))} | game_mode:{m.get('game_mode')}"
+    mmr_line = ""
+    if m.get("lobby_type")==7 and mmr_after is not None and delta is not None:
+        arrow = "▲" if delta>0 else ("▼" if delta<0 else "•")
+        mmr_line = f"\n📈 ΔMMR: {arrow} {delta:+d}\n📊 Текущий: <b>{mmr_after}</b>"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton("Открыть на OpenDota", url=f"{OPEN_DOTA}/matches/{m.get('match_id')}")]
+    ])
+    text = (
+        f"🎮 <b>Новая игра</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 {when}\n"
+        f"🧩 {mode_text}\n"
+        f"🧙 Герой: <b>{hero}</b>\n"
+        f"⚔️ {kdastr} • ⏱ {dur}\n"
+        f"🏆 Итог: {res}"
+        f"{mmr_line}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+    try:
+        await bot.send_message(to_tg, text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logger.exception("Failed to send match card to %s: %s", to_tg, e)
+
+async def poll_worker():
+    init_db()
+    await asyncio.sleep(3)
+    while True:
+        try:
+            users = db_get_all_users_with_steam()
+            if not users:
+                await asyncio.sleep(POLL_INTERVAL); continue
+            async with aiohttp.ClientSession() as sess:
+                heroes_map = await od_heroes_map()
+                for u in users:
+                    try:
+                        tg = u["telegram_id"]
+                        steam32 = int(u["steam32"])
+                        # fetch last match any
+                        matches = await od_matches(steam32, limit=1, params={})
+                        if not matches:
+                            continue
+                        m = matches[0]
+                        last_any_db = u.get("last_any_match")
+                        if last_any_db != m.get("match_id"):
+                            # new match for this user
+                            # get details to determine networth/gpm/purchases
+                            detail = await od_match_detail(m.get("match_id"))
+                            nw = None; gpm=None; role="core"
+                            if detail and "players" in detail:
+                                for p in detail["players"]:
+                                    if p.get("account_id") == steam32:
+                                        nw = p.get("net_worth"); gpm = p.get("gold_per_min")
+                                        purchases = [it.get("key","") for it in p.get("purchase_log", [])]
+                                        role = guess_role_from_purchase_and_gpm(purchases, gpm or 0)
+                                        break
+                            # mmr delta only for ranked
+                            delta=None; mmr_after=None
+                            if m.get("lobby_type")==7:
+                                # determine base current mmr (exact preferred)
+                                dbu = db_get_user(tg)
+                                effective = dbu.get("exact_mmr") if dbu.get("exact_mmr") is not None else dbu.get("current_mmr")
+                                if isinstance(effective, int):
+                                    win = is_player_win(m.get("player_slot",0), bool(m.get("radiant_win")))
+                                    delta = ASSUMED_MMR_DELTA if win else -ASSUMED_MMR_DELTA
+                                    mmr_after = effective + delta
+                                    # update in DB: if user has exact_mmr set, modify it (we assume it's 'current state'), else update auto current_mmr
+                                    if dbu.get("exact_mmr") is not None:
+                                        db_update_exact_mmr(tg, mmr_after)
+                                    else:
+                                        db_update_auto_mmr(tg, mmr_after)
+                            # store match
+                            db_upsert_match(str(steam32), m, nw, gpm, delta, mmr_after)
+                            # update last ids
+                            db_set_last_ids(tg, any_id=m.get("match_id"))
+                            # send notification
+                            await send_match_card(tg, heroes_map or [], m, mmr_after, delta)
+                            # streak notifications (calculate)
+                            streak = calc_streak_for_user(str(steam32))
+                            if streak >= STREAK_NOTIFY_WIN:
+                                await bot.send_message(tg, f"🔥 Винстрик: {streak} побед подряд!")
+                            if streak <= -STREAK_NOTIFY_LOSE:
+                                await bot.send_message(tg, f"💀 Лузстрик: {-streak} поражений подряд.")
+                        # handle ranked separately for last_ranked id
+                        ranked_matches = await od_matches(steam32, limit=1, params={"lobby_type":7})
+                        if ranked_matches:
+                            rid = ranked_matches[0].get("match_id")
+                            if u.get("last_ranked_match") != rid:
+                                db_set_last_ids(tg, ranked_id=rid)
+                    except Exception as e:
+                        logger.exception("Error handling user %s in poll_worker: %s", u, e)
+            await asyncio.sleep(POLL_INTERVAL)
+        except Exception as e:
+            logger.exception("poll_worker crashed: %s", e)
+            await asyncio.sleep(10)
+
+# streak calc helper
+def calc_streak_for_user(steam32:str) -> int:
+    # positive for winning streak, negative for losing streak
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        rs = con.execute("SELECT radiant_win, player_slot FROM matches WHERE steam32=? ORDER BY start_time DESC LIMIT 50", (steam32,)).fetchall()
+    if not rs: return 0
+    streak = 0; last_win=None
+    for r in rs:
+        win = ((r["player_slot"]<128) and (r["radiant_win"]==1)) or ((r["player_slot"]>=128) and (r["radiant_win"]==0))
+        if last_win is None:
+            last_win = win; streak = 1
+        elif win == last_win:
+            streak += 1
+        else:
+            break
+    return streak if last_win else -streak if streak else 0
+
+# daily summary worker (sends report to all users at 23:59 MSK)
+def seconds_until_daily():
+    now_utc = datetime.now(timezone.utc)
+    now_msk = now_utc + timedelta(hours=MSK_OFFSET)
+    target = now_msk.replace(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE, second=0, microsecond=0)
+    if target <= now_msk:
+        target += timedelta(days=1)
+    return int((target - now_msk).total_seconds())
+
+async def daily_worker():
     await asyncio.sleep(5)
     while True:
         try:
-            wait = seconds_until_2359_msk()
+            wait = seconds_until_daily()
+            logger.info("Daily worker sleeping %s seconds", wait)
             await asyncio.sleep(wait)
-            users = db_get_users_with_steam()
+            users = db_get_all_users_with_steam()
             if not users:
                 continue
-
-            # интервал на сегодня по МСК
+            # determine today's start/end in UTC timestamps
             now_utc = datetime.now(timezone.utc)
-            now_msk = now_utc + timedelta(hours=MSK_OFFSET_HOURS)
+            now_msk = now_utc + timedelta(hours=MSK_OFFSET)
             start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-            start_ts = int((start_msk - timedelta(hours=MSK_OFFSET_HOURS)).timestamp())
-            end_ts = int((now_msk - timedelta(hours=MSK_OFFSET_HOURS)).timestamp())
-
-            async with aiohttp.ClientSession() as sess:
-                for u in users:
-                    steam32 = u["steam32"]; tg = u["telegram_id"]
-                    arr = await fetch_last_matches(sess, steam32, limit=200, ranked_only=False)
-                    today = [m for m in arr if start_ts <= m["start_time"] <= end_ts]
-
+            start_utc = start_msk - timedelta(hours=MSK_OFFSET)
+            start_ts = int(start_utc.timestamp())
+            end_ts = int(now_utc.timestamp())
+            for u in users:
+                try:
+                    steam32 = u["steam32"]
+                    tg = u["telegram_id"]
+                    # get matches today (from OpenDota)
+                    arr = await od_matches(int(steam32), limit=200) or []
+                    today = [m for m in arr if start_ts <= m.get("start_time",0) <= end_ts]
                     games = len(today)
-                    wins = sum(1 for m in today if is_win(m.get("player_slot",0), m.get("radiant_win",False)))
+                    wins = sum(1 for m in today if is_player_win(m.get("player_slot",0), bool(m.get("radiant_win"))))
                     loses = games - wins
                     wr = round(100*wins/games) if games else 0
-
-                    # ΔMMR из БД по сегодняшним ranked
-                    with closing(sqlite3.connect(DB_PATH)) as con:
-                        con.row_factory = sqlite3.Row
-                        rs = con.execute("""
-                            SELECT SUM(COALESCE(delta_mmr,0)) s FROM matches
-                            WHERE steam32=? AND lobby_type=7 AND start_time BETWEEN ? AND ?
-                        """, (steam32, start_ts, end_ts)).fetchone()
-                        dm = rs["s"] if rs and rs["s"] is not None else 0
-
-                    curr = effective_mmr(db_get_user(tg))
-                    txt = (
+                    dm = db_sum_delta_mmr_today(str(steam32), start_ts, end_ts)
+                    eff = (u.get("exact_mmr") if u.get("exact_mmr") is not None else u.get("current_mmr"))
+                    text = (
                         "📊 <b>Итоги дня</b>\n"
                         f"• Игр: <b>{games}</b>\n"
                         f"• Победы/Поражения: <b>{wins}</b>/<b>{loses}</b> (WR <b>{wr}%</b>)\n"
                         f"• Δ MMR (ranked): <b>{dm:+d}</b>\n"
-                        f"• Текущий рейтинг: <b>{curr if curr is not None else '—'}</b>"
+                        f"• Текущий рейтинг: <b>{eff if eff is not None else '—'}</b>\n"
                     )
                     if games == 0:
-                        txt += "\n• Сегодня ты не играл — удачи завтра! ✨"
-                    await bot.send_message(tg, txt, parse_mode="HTML")
-
+                        text += "\n• Сегодня ты не играл — удачи завтра! ✨"
+                    await bot.send_message(tg, text, parse_mode="HTML")
+                except Exception as e:
+                    logger.exception("daily_worker user send failed: %s", e)
         except Exception as e:
-            logging.warning(f"daily_summary_worker error: {e}")
-            await asyncio.sleep(10)
+            logger.exception("daily_worker crashed: %s", e)
+            await asyncio.sleep(30)
 
-# ========= STARTUP =========
-async def main():
-    db_init()
+# ---------------- Startup ----------------
+async def on_startup(dispatcher: Dispatcher):
+    logger.info("Bot started, initializing DB and tasks")
+    init_db()
+    # start background tasks
     asyncio.create_task(poll_worker())
-    asyncio.create_task(daily_summary_worker())
-    await dp.start_polling(bot)
+    asyncio.create_task(daily_worker())
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        from aiogram import executor
+        executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
     except KeyboardInterrupt:
-        pass
+        logger.info("Stopping bot by KeyboardInterrupt")
